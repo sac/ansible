@@ -86,6 +86,11 @@ options:
       - If brick is being created in the root partition, module will fail.
         Set force to true to override this behaviour.
     type: bool
+  master:
+    description:
+      - The node from which to run the volume commands. This is required for the
+        API calls in GlusterFS 4.0 and above
+    version_added: '2.7'
 notes:
   - Requires cli tools for GlusterFS on servers.
   - Will add new bricks, but not remove them.
@@ -159,9 +164,12 @@ import re
 import socket
 import time
 import traceback
+from distutils.version import LooseVersion
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils._text import to_native
+from ansible.module_utils.storage.glusterfs import Client
+from ansible.module_utils.storage.glusterfs.exceptions import GlusterApiError
 
 glusterbin = ''
 
@@ -366,6 +374,189 @@ def set_quota(name, directory, value):
     run_gluster(['volume', 'quota', name, 'limit-usage', directory, value])
 
 
+def check_gluster_version(module):
+    cmd = module.get_bin_path('gluster', True) + ' --version'
+    lang = dict(LANG='C', LC_ALL='C', LC_MESSAGES='C')
+    rc, output, err = module.run_command(cmd, environ_update=lang)
+    if rc > 0:
+        module.fail_json(msg="GlusterFS is not installed, GlusterFS" +
+                         "version > 3.2 is required.")
+    ver_line = output.split('\n')[0]
+    version = ver_line.split(' ')[1]
+    return version
+
+
+class GlusterVolume(object):
+    def __init__(self, module):
+        # Init the parameters
+        self.state = module.params['state']
+        self.volume_name = module.params['name']
+        self.cluster = module.params['cluster']
+        self.brick_paths = module.params['bricks']
+        self.stripes = module.params['stripes']
+        self.replicas = module.params['replicas']
+        self.arbiters = module.params['arbiters']
+        self.disperses = module.params['disperses']
+        self.redundancies = module.params['redundancies']
+        self.transport = module.params['transport']
+        self.myhostname = module.params['host']
+        self.start_on_create = module.boolean(module.params['start_on_create'])
+        self.rebalance = module.boolean(module.params['rebalance'])
+        self.force = module.boolean(module.params['force'])
+        self.module = module
+        # GlusterD2.0 specific options
+        self.user = self.module.params['user']
+        self.passwd = self.module.params['passwd']
+        self.verify = self.module.params['verify']
+        self.port = self.module.params['port']
+        self.master = self.module.params['master']
+
+    def _get_peers(self):
+        peer_info = dict()
+
+        try:
+            status, peer_list = self.client.peer_status()
+        except GlusterApiError as e:
+            self.module.fail_json(msg="Unable to get peer list: %s" %
+                                  e.message.reason)
+        if status == 200:       # Success
+            for peer in peer_list:
+                hostname = peer['name']
+                peer_ipaddr = peer['peer-addresses'][0].split(':')[0]
+                peer_id = peer['id']
+                peer_info[hostname] = peer_id
+                peer_info[peer_ipaddr] = peer_id
+        else:
+            self.module.fail_json(msg="Failed to get peers")
+        return peer_info
+
+    def _get_volinfo(self):
+        vol_info = dict()
+
+        try:
+            pass
+        except GlusterApiError as e:
+            pass
+        return vol_info
+
+    def _add_peers(self, peers, peer_info):
+        for peer in peers:
+            try:
+                ret, result = self.client.peer_add(peer)
+                if result:
+                    peer_info[peer] = result['id']
+                    peer_info[result['name']] = result['id']
+            except GlusterApiError as e:
+                reason = e.message.reason
+                if reason.lower() == "internal server error":
+                    self.module.fail_json(msg="Failed: %s" % reason)
+        return peer_info
+
+    def create_volume(self):
+        changed = False
+        # Create a GlusterD2 volume
+        brickinfo = list()
+        bricks = self.brick_paths.split(",")
+        # Check if peers are probed, else probe and create volume
+        peer_info = self._get_peers()
+        peers_to_probe = [peer for peer in self.cluster if
+                          peer not in peer_info.keys()]
+        if peers_to_probe:
+            peer_info = self._add_peers(peers_to_probe, peer_info)
+        # Create brick path for volume creation. GlusterD2 needs volume-id for
+        # brick creation
+        for node in self.cluster:
+            uuid = peer_info[node]
+            for brick in bricks:
+                brickinfo.append("%s:%s" % (uuid, brick))
+
+        # Do not create a volume if it is already present, when the support in
+        # python API is available get the list of volumes and compare
+        try:
+            code, out = self.client.volume_create(self.volume_name,
+                                                  bricks=brickinfo,
+                                                  replica=self.replicas,
+                                                  disperse=self.disperses,
+                                                  arbiter=self.arbiters,
+                                                  disperse_redundancy=self.redundancies,
+                                                  force=self.force)
+            if code == 201:
+                changed = True
+        except GlusterApiError as e:
+            reason = e.message.reason
+            # Once the error codes are refined, fail only on fatal errors
+            # For now, we ignore the errors
+
+        # Start the volume if start_on_create is set
+        if self.start_on_create:
+            try:
+                code, out = self.client.volume_start(self.volume_name,
+                                                     self.force)
+                if out['state'].lower() != "started":
+                    self.module.fail_json(msg="Unable to start the volume")
+            except GlusterApiError as e:
+                pass
+        return changed
+
+    def stop_volume(self):
+        changed = False
+        # TODO: get the volume info and check the state
+        try:
+            retcode, out = self.client.volume_stop(self.volume_name)
+            if out['state'].lower() == "stopped":
+                changed = True
+            else:
+                # Fixme: Give a proper error code
+                self.module.fail_json("Unable to stop the volume")
+        except GlusterApiError as e:
+            # When the error codes are implemented, print proper message
+            pass        # Fix API! Do not raise an exception if unable to stop
+            # self.module.fail_json(msg="Unable to stop the volume")
+        return changed
+
+    def delete_volume(self):
+        changed = False
+        # Try to stop the volume if it is already started
+        changed = self.stop_volume()
+
+        # Delete the volume
+        try:
+            retcode, out = self.client.volume_delete(self.volume_name)
+            if retcode == 204:         # volume deleted successfully
+                changed = True
+        except GlusterApiError as e:
+            self.module.fail_json(msg="Unable to delete the volume")
+        return changed
+
+    def start_volume(self):
+        # TODO: Handle cases when state=changed and other variables are set.
+        try:
+            code, out = self.client.volume_start(self.volume_name,
+                                                 self.force)
+            if out['state'].lower() != "started":
+                self.module.fail_json(msg="Unable to start the volume")
+                changed = True
+        except GlusterApiError as e:
+            self.module.fail_json(msg="Unable to start the volume")
+
+    def manage_vol(self):
+        changed = False
+        if self.master is None:
+            self.module.fail_json(msg="master variable has to be set to use" +
+                                  "gluster_volume with GlusterFS-4.0 or above")
+        master = "http://" + self.master + ":%s" % self.port
+        self.client = Client(master, self.user, self.passwd, self.verify)
+        if self.state == "present":
+            changed = self.create_volume()
+        elif self.state == "absent":
+            changed = self.delete_volume()
+        elif self.state == "started":
+            changed = self.start_volume()
+        elif self.state == "stopped":
+            changed = self.stop_volume()
+        self.module.exit_json(changed=changed)
+
+
 def main():
     # MAIN
 
@@ -389,8 +580,19 @@ def main():
             quota=dict(type='str'),
             directory=dict(type='str'),
             force=dict(type='bool', default=False),
+            master=dict(type='str', required=False),
+            user=dict(type='str', required=False),
+            passwd=dict(type='str', required=False, no_log=True),
+            verify=dict(type='str', required=False, default=False),
+            port=dict(type='str', required=False, default='24007'),
         ),
     )
+
+    # If gluster version is greater than 4.0, call gluster API
+    version = check_gluster_version(module)
+    if LooseVersion(version) > LooseVersion("4"):
+        gluster_vol = GlusterVolume(module)
+        gluster_vol.manage_vol()
 
     global glusterbin
     glusterbin = module.get_bin_path('gluster', True)
